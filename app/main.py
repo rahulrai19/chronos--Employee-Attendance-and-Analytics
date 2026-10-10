@@ -16,6 +16,9 @@ from pymongo.errors import DuplicateKeyError
 from decimal import Decimal, ROUND_HALF_UP
 from bson import json_util
 
+# fixed that BSON TimeStamps to JSON using the json_util.dumps() imported the json_util
+# line changed : 288,305,345,363,389,393
+
 load_dotenv()
 
 client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
@@ -37,9 +40,8 @@ def startup_db_client():
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
-# --------------------------------------------------------------------------- #
 # Helpers
-# --------------------------------------------------------------------------- #
+
 def to_epoch_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
@@ -75,10 +77,8 @@ def round_half_up(value, decimals=2):
     if value is None: return None
     return float(Decimal(str(value)).quantize(Decimal(f"0.{'0'*decimals}"), rounding=ROUND_HALF_UP))
 
-
-# --------------------------------------------------------------------------- #
 # Models
-# --------------------------------------------------------------------------- #
+
 class EmployeeIn(BaseModel):
     emp_code: str = Field(..., pattern=r'^EMP\d{4,6}$')
     name: str = Field(..., min_length=1, max_length=100)
@@ -125,9 +125,12 @@ def format_attendance(doc):
                     if h["changes"][k].get("to"): h["changes"][k]["to"] = to_epoch_ms(h["changes"][k]["to"])
     return doc
 
-# --------------------------------------------------------------------------- #
 # Endpoints provided
-# --------------------------------------------------------------------------- #
+
+@app.get("/")
+def home():
+    return {"message": "Welcome to Chronos - Employee Attendance and Analytics API"}
+
 @app.get("/health")
 def health():
     try:
@@ -269,9 +272,8 @@ def list_attendance(
         "page_size": page_size
     }
 
-# --------------------------------------------------------------------------- #
 # Explain Endpoint
-# --------------------------------------------------------------------------- #
+
 @app.get("/admin/explain/{endpoint}")
 def explain_endpoint(endpoint: str, request: Request):
     valid = ["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"]
@@ -391,6 +393,7 @@ def explain_endpoint(endpoint: str, request: Request):
         ]
         raw = db.command("explain", {"aggregate": "employees", "pipeline": pipeline, "cursor": {}}, verbosity="executionStats")
         
+ # converted bison to json
     return json.loads(json_util.dumps(raw))
 
 @app.get("/analytics/employees/{emp_code}/monthly")
