@@ -1,21 +1,17 @@
 """
 Employee Attendance & Analytics API - STARTER
-
-Run:  uvicorn app.main:app --port 8000
-Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
-
-This file was written quickly by a colleague who has left the company. The happy path
-works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
-openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from pymongo import MongoClient
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
@@ -26,99 +22,173 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 
+@app.on_event("startup")
+def startup_db_client():
+    # Create indexes idempotently at startup
+    db.employees.create_index("emp_code", unique=True)
+    db.attendance_logs.create_index([("emp_code", ASCENDING), ("date", ASCENDING)], unique=True)
+    db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)])
+    db.employees.create_index("department")
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
+def to_epoch_ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+def compute_late_minutes(punch_in_dt: datetime, shift_start: str, date_str: str) -> int:
     h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
+    shift_start_dt = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
+    
+    if punch_in_dt <= shift_start_dt:
+        return 0
+        
+    diff = punch_in_dt - shift_start_dt
+    minutes = int(diff.total_seconds() // 60)
     return minutes if minutes > 10 else 0
-
-
-def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
-
-
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
 
 
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
-    joined_on: str
-
+    emp_code: str = Field(..., pattern=r'^EMP\d{4,6}$')
+    name: str = Field(..., min_length=1, max_length=100)
+    email: str = Field(..., max_length=120, pattern=r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+    department: str = Field(..., min_length=1, max_length=50)
+    shift_start: str = Field(default="09:30", pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
+    shift_end: str = Field(default="18:30", pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
+    joined_on: str 
 
 class PunchInIn(BaseModel):
     emp_code: str
     punched_at: Optional[int] = None
     status: str = "PRESENT"
 
+def format_employee(doc):
+    doc.pop("_id", None)
+    if "created_at" in doc and isinstance(doc["created_at"], datetime):
+        doc["created_at"] = to_epoch_ms(doc["created_at"])
+    return doc
+
+def format_attendance(doc):
+    doc.pop("_id", None)
+    if doc.get("punch_in"):
+        doc["punch_in"] = to_epoch_ms(doc["punch_in"])
+    if doc.get("punch_out"):
+        doc["punch_out"] = to_epoch_ms(doc["punch_out"])
+    for h in doc.get("history", []):
+        if "at" in h: h["at"] = to_epoch_ms(h["at"])
+        if "changes" in h:
+            for k in ["punch_in", "punch_out"]:
+                if k in h["changes"]:
+                    if h["changes"][k].get("from"): h["changes"][k]["from"] = to_epoch_ms(h["changes"][k]["from"])
+                    if h["changes"][k].get("to"): h["changes"][k]["to"] = to_epoch_ms(h["changes"][k]["to"])
+    return doc
 
 # --------------------------------------------------------------------------- #
 # Endpoints provided
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    try:
+        db.command("ping")
+        return {"status": "ok"}
+    except Exception:
+        raise HTTPException(503, "Database unavailable")
 
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
+    if body.shift_start == body.shift_end:
+        raise HTTPException(422, "shift_start and shift_end cannot be the same")
+    
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+    doc["created_at"] = datetime.now(timezone.utc)
+    
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
+        
+    return format_employee(doc)
 
 
 @app.get("/employees")
 def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+    if page < 1: raise HTTPException(422, "page >= 1")
+    if page_size < 1 or page_size > 100: raise HTTPException(422, "page_size bounds")
+    
     q = {}
     if department:
         q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+        
+    skip = (page - 1) * page_size
+    total = db.employees.count_documents(q)
+    items = list(db.employees.find(q).sort("emp_code", ASCENDING).skip(skip).limit(page_size))
+    
+    return {
+        "items": [format_employee(d) for d in items], 
+        "total": total, 
+        "page": page, 
+        "page_size": page_size
+    }
 
 
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
+    if body.status not in ["PRESENT", "WFH", "ON_DUTY"]:
+        raise HTTPException(422, "Invalid status for punch in")
+
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    if not emp:
+        raise HTTPException(404, "Employee not found")
+        
+    if body.punched_at is not None:
+        if body.punched_at < 100000000000 or body.punched_at > 4102444800000:
+            raise HTTPException(422, "Invalid epoch milliseconds")
+        ts = datetime.fromtimestamp(body.punched_at / 1000, tz=timezone.utc)
+    else:
+        ts = datetime.now(timezone.utc)
+        
+    # R1: Truncate to whole seconds
+    ts = ts.replace(microsecond=0)
+    
+    # Calculate attendance date
+    ts_ist = ts.astimezone(IST)
+    att_date = ts_ist.date()
+    
+    # R1: Overnight shift check
+    if emp["shift_end"] <= emp["shift_start"]:
+        h_end, m_end = map(int, emp["shift_end"].split(":"))
+        if ts_ist.hour < h_end or (ts_ist.hour == h_end and ts_ist.minute < m_end):
+            att_date = att_date - timedelta(days=1)
+            
+    d_str = att_date.isoformat()
+    
     doc = {
         "emp_code": body.emp_code,
-        "date": d,
+        "date": d_str,
         "status": body.status,
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts_ist, emp["shift_start"], d_str),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date")
+        
+    return format_attendance(doc)
 
 
 @app.get("/attendance")
@@ -130,25 +200,39 @@ def list_attendance(
     page: int = 1,
     page_size: int = 20,
 ):
+    if page < 1: raise HTTPException(422, "page must be >= 1")
+    if page_size < 1 or page_size > 100: raise HTTPException(422, "page_size between 1 and 100")
+    
     q = {}
     if emp_code:
         q["emp_code"] = emp_code
+        
     if date_from or date_to:
         q["date"] = {}
         if date_from:
             q["date"]["$gte"] = date_from
         if date_to:
             q["date"]["$lte"] = date_to
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(422, "date_from > date_to")
+            
     if status:
+        if status not in ["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]:
+            raise HTTPException(422, "Invalid status")
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
-
+        
+    skip = (page - 1) * page_size
+    total = db.attendance_logs.count_documents(q)
+    
+    cursor = db.attendance_logs.find(q).sort([("date", DESCENDING), ("emp_code", ASCENDING)]).skip(skip).limit(page_size)
+    items = list(cursor)
+    
+    return {
+        "items": [format_attendance(d) for d in items], 
+        "total": total, 
+        "page": page, 
+        "page_size": page_size
+    }
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
