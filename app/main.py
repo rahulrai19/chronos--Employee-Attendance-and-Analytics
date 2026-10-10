@@ -2,6 +2,7 @@
 Employee Attendance & Analytics API - STARTER
 """
 import os
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -13,6 +14,7 @@ from pydantic import BaseModel, Field
 from pymongo import MongoClient, ASCENDING, DESCENDING, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from decimal import Decimal, ROUND_HALF_UP
+from bson import json_util
 
 load_dotenv()
 
@@ -286,7 +288,7 @@ def explain_endpoint(endpoint: str, request: Request):
             if "date_from" in params: q["date"]["$gte"] = params["date_from"]
             if "date_to" in params: q["date"]["$lte"] = params["date_to"]
         if "status" in params: q["status"] = params["status"]
-        return db.command("explain", {"find": "attendance_logs", "filter": q, "sort": {"date": -1, "emp_code": 1}}, verbosity="executionStats")
+        raw = db.command("explain", {"find": "attendance_logs", "filter": q, "sort": {"date": -1, "emp_code": 1}}, verbosity="executionStats")
         
     elif endpoint == "employee_monthly":
         emp_code = params.get("emp_code", "EMP0000")
@@ -303,7 +305,7 @@ def explain_endpoint(endpoint: str, request: Request):
                 "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}}
             }}
         ]
-        return db.command("explain", {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}}, verbosity="executionStats")
+        raw = db.command("explain", {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}}, verbosity="executionStats")
         
     elif endpoint == "department_summary":
         month = params.get("month", "2000-01")
@@ -343,7 +345,7 @@ def explain_endpoint(endpoint: str, request: Request):
             }},
             {"$sort": {"department": 1}}
         ]
-        return db.command("explain", {"aggregate": "employees", "pipeline": pipeline, "cursor": {}}, verbosity="executionStats")
+        raw = db.command("explain", {"aggregate": "employees", "pipeline": pipeline, "cursor": {}}, verbosity="executionStats")
         
     elif endpoint == "late_leaderboard":
         month = params.get("month", "2000-01")
@@ -361,7 +363,7 @@ def explain_endpoint(endpoint: str, request: Request):
             {"$project": {"_id": 0, "rank": 1, "emp_code": "$_id", "name": "$emp.name", "department": "$emp.department", "total_late_minutes": 1, "late_count": 1}},
             {"$sort": {"rank": 1, "emp_code": 1}}
         ])
-        return db.command("explain", {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}}, verbosity="executionStats")
+        raw = db.command("explain", {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}}, verbosity="executionStats")
         
     elif endpoint == "department_trend":
         department = params.get("department", "Unknown")
@@ -387,7 +389,9 @@ def explain_endpoint(endpoint: str, request: Request):
             {"$project": {"_id": 0, "date": 1, "is_working_day": 1, "headcount": 1, "present_count": 1, "late_count": 1, "attendance_rate": 1, "moving_avg_7d": "$moving_avg_7d_raw"}},
             {"$sort": {"date": 1}}
         ]
-        return db.command("explain", {"aggregate": "employees", "pipeline": pipeline, "cursor": {}}, verbosity="executionStats")
+        raw = db.command("explain", {"aggregate": "employees", "pipeline": pipeline, "cursor": {}}, verbosity="executionStats")
+        
+    return json.loads(json_util.dumps(raw))
 
 @app.get("/analytics/employees/{emp_code}/monthly")
 def employee_monthly(emp_code: str, month: str):
