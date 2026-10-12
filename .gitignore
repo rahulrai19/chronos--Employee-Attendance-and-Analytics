@@ -3,3 +3,9 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+FIX.md
+DATA_MODEL.md
+openapi.yaml
+PROBLEM_STATEMENT.docx
+sample_seed.py
+sample_data/
