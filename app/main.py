@@ -587,12 +587,17 @@ def list_attendance(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
+    DATE_REGEX = r"^\d{4}-\d{2}-\d{2}$"
     if date_from:
+        if not re.match(DATE_REGEX, date_from):
+            raise HTTPException(422, "Invalid date_from format; expected YYYY-MM-DD")
         try:
             date.fromisoformat(date_from)
         except ValueError:
             raise HTTPException(422, "Invalid date_from format; expected YYYY-MM-DD")
     if date_to:
+        if not re.match(DATE_REGEX, date_to):
+            raise HTTPException(422, "Invalid date_to format; expected YYYY-MM-DD")
         try:
             date.fromisoformat(date_to)
         except ValueError:
@@ -635,11 +640,15 @@ def explain_endpoint(endpoint: str, request: Request):
         page_size_val = params.get("page_size", 20)
 
         if date_from:
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_from):
+                raise HTTPException(422, "Invalid date_from format")
             try:
                 date.fromisoformat(date_from)
             except ValueError:
                 raise HTTPException(422, "Invalid date_from format")
         if date_to:
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_to):
+                raise HTTPException(422, "Invalid date_to format")
             try:
                 date.fromisoformat(date_to)
             except ValueError:
@@ -794,6 +803,9 @@ def department_trend(
     if not db.employees.find_one({"department": department}):
         raise HTTPException(404, "Unknown department")
 
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", from_date) or not re.match(r"^\d{4}-\d{2}-\d{2}$", to_date):
+        raise HTTPException(422, "Invalid date format; expected YYYY-MM-DD")
+
     try:
         from_d = date.fromisoformat(from_date)
         to_d = date.fromisoformat(to_date)
@@ -826,7 +838,7 @@ def punch_out(body: PunchOutIn):
 
     record = db.attendance_logs.find_one({
         "emp_code": body.emp_code,
-        "punch_in": {"$lte": ts}
+        "punch_in": {"$ne": None}
     }, sort=[("punch_in", DESCENDING)])
 
     if not record:
